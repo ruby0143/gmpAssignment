@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -39,6 +40,8 @@ load_dotenv(Path(__file__).parent / ".env")
 
 SENTIMENT_MODEL = os.environ.get("SENTIMENT_MODEL", "cardiffnlp/twitter-roberta-base-sentiment-latest")
 LLM_MODEL = os.environ.get("LLM_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
+DEFAULT_LLM_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"  # Gemini
+LLM_TIMEOUT_SECONDS = 180
 
 MAX_REVIEWS = 200
 MAX_REVIEW_CHARS = 600
@@ -294,14 +297,57 @@ def validate_payload(payload: dict, review_count: int) -> tuple[list[PainPoint],
     return [p for _, p in kept], recs
 
 
+TRANSIENT_STATUS = {429, 500, 502, 503, 504}
+TRANSIENT_RETRY_DELAYS = (3, 8, 15)  # seconds to wait before each retry
+
+
+def _call_openai_compatible(prompt: str, base_url: str, api_key: str) -> str:
+    """Any OpenAI-compatible chat endpoint (Gemini, Groq, OpenRouter, GitHub Models, ...). Retries transient errors."""
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "max_tokens": 8000,  # generous: reasoning models count thinking tokens against this limit
+    }
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    for attempt in range(len(TRANSIENT_RETRY_DELAYS) + 1):
+        try:
+            response = httpx.post(
+                url, headers={"Authorization": f"Bearer {api_key}"}, json=payload, timeout=LLM_TIMEOUT_SECONDS
+            )
+            if response.status_code in TRANSIENT_STATUS and attempt < len(TRANSIENT_RETRY_DELAYS):
+                time.sleep(TRANSIENT_RETRY_DELAYS[attempt])
+                continue
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"] or ""
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text[:300].replace(api_key, "***")
+            raise AnalysisError(
+                f"The language model request failed ({LLM_MODEL}, HTTP {exc.response.status_code}): {detail}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            if attempt < len(TRANSIENT_RETRY_DELAYS):
+                time.sleep(TRANSIENT_RETRY_DELAYS[attempt])
+                continue
+            raise AnalysisError(f"The language model request failed ({LLM_MODEL}): {type(exc).__name__} {exc}") from exc
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise AnalysisError(f"The language model returned an unexpected response format ({LLM_MODEL}).") from exc
+    raise AnalysisError(f"The language model request failed ({LLM_MODEL}).")  # unreachable; satisfies type checkers
+
+
 def call_llm(prompt: str) -> str:
+    """Use an OpenAI-compatible provider if LLM_API_KEY is set, otherwise the Hugging Face Inference API."""
+    api_key = os.environ.get("LLM_API_KEY")
+    if api_key:
+        return _call_openai_compatible(prompt, os.environ.get("LLM_BASE_URL", DEFAULT_LLM_BASE_URL), api_key)
+
     token = os.environ.get("HF_TOKEN")
     if not token:
         raise AnalysisError(
-            "HF_TOKEN is not set. Add a Hugging Face access token as a Space secret named HF_TOKEN "
-            "(or export it locally) to enable pain-point extraction and recommendations."
+            "No LLM credentials found. Set LLM_API_KEY (any OpenAI-compatible provider, see README) or HF_TOKEN "
+            "(Hugging Face Inference Providers; requires credits) as an environment variable, Space secret or in .env."
         )
-    client = InferenceClient(model=LLM_MODEL, token=token, timeout=120)
+    client = InferenceClient(model=LLM_MODEL, token=token, timeout=LLM_TIMEOUT_SECONDS)
     try:
         response = client.chat_completion(
             messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
@@ -422,7 +468,9 @@ def analyze(
     limit: float,
 ):
     try:
-        schema = _schema_from_ui(review_col, title_col, date_col, rating_col, group_col) if file_path else None
+        schema = (
+            _schema_from_ui(review_col, title_col, date_col, rating_col, group_col) if file_path and review_col else None
+        )  # no mapping chosen: auto-detect
         df, warnings = parse_reviews(text, file_path, schema, group_value or None, int(limit))
         df = pd.concat([df, classify_sentiment(df["review"].tolist())], axis=1)
         points, recs = generate_insights(df, target, product.strip() or (group_value or ""))

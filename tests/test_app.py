@@ -95,7 +95,8 @@ def test_trend_requires_two_periods():
 
 def test_missing_token_is_explicit(monkeypatch):
     monkeypatch.delenv("HF_TOKEN", raising=False)
-    with pytest.raises(app.AnalysisError, match="HF_TOKEN"):
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    with pytest.raises(app.AnalysisError, match="LLM_API_KEY"):
         app.call_llm("x")
 
 
@@ -223,3 +224,55 @@ def test_load_dotenv_does_not_override(tmp_path, monkeypatch):
     assert app.os.environ["DOTENV_A"] == "one" and app.os.environ["DOTENV_B"] == "keep"
     monkeypatch.delenv("DOTENV_A")
     app.load_dotenv(tmp_path / "missing.env")  # no error
+
+
+def test_openai_compatible_provider(monkeypatch):
+    import httpx
+
+    seen = {}
+
+    def fake_post(url, headers, json, timeout):
+        seen.update(url=url, auth=headers["Authorization"], model=json["model"])
+        return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]}, request=httpx.Request("POST", url))
+
+    monkeypatch.setenv("LLM_API_KEY", "secret-key")
+    monkeypatch.setenv("LLM_BASE_URL", "https://example.test/v1/")
+    monkeypatch.setattr(app.httpx, "post", fake_post)
+    assert app.call_llm("hi") == "{}"
+    assert seen["url"] == "https://example.test/v1/chat/completions" and seen["auth"] == "Bearer secret-key"
+
+
+def test_openai_compatible_errors_hide_key(monkeypatch):
+    import httpx
+
+    def fake_post(url, headers, json, timeout):
+        return httpx.Response(429, text="quota exceeded for secret-key", request=httpx.Request("POST", url))
+
+    monkeypatch.setenv("LLM_API_KEY", "secret-key")
+    monkeypatch.setattr(app.httpx, "post", fake_post)
+    with pytest.raises(app.AnalysisError) as exc:
+        app.call_llm("hi")
+    assert "429" in str(exc.value) and "secret-key" not in str(exc.value)
+
+
+def test_transient_errors_are_retried(monkeypatch):
+    import httpx
+
+    calls = []
+
+    def fake_post(url, headers, json, timeout):
+        calls.append(1)
+        status = 503 if len(calls) < 3 else 200
+        body = {"choices": [{"message": {"content": "ok"}}]} if status == 200 else {"error": "busy"}
+        return httpx.Response(status, json=body, request=httpx.Request("POST", url))
+
+    monkeypatch.setenv("LLM_API_KEY", "k")
+    monkeypatch.setattr(app.httpx, "post", fake_post)
+    monkeypatch.setattr(app.time, "sleep", lambda s: None)
+    assert app.call_llm("hi") == "ok" and len(calls) == 3
+
+
+def test_analyze_autodetects_when_mapping_is_empty(monkeypatch):
+    monkeypatch.setattr(app, "call_llm", lambda p: json.dumps(good_payload()))
+    out = app.analyze("", str(app.SAMPLE_PATH), "My product", "", None, None, None, None, None, None, 200)
+    assert "24 reviews analyzed" in out[0]

@@ -56,7 +56,7 @@ Two models are involved, with different jobs:
 | Model | Where it runs | Job |
 |---|---|---|
 | `cardiffnlp/twitter-roberta-base-sentiment-latest` | Locally inside the app (downloaded once, about 0.5 GB) | Classify each review as positive, neutral or negative with a confidence score |
-| `meta-llama/Llama-3.1-8B-Instruct` | Remotely via the Hugging Face Inference API (needs `HF_TOKEN`) | Read the reviews and produce pain points and recommendations |
+| An LLM chosen by `LLM_MODEL` (tested with `gemini-2.5-flash` via Google's free OpenAI-compatible API; `meta-llama/Llama-3.1-8B-Instruct` via Hugging Face Inference Providers also supported) | Remotely, with `LLM_API_KEY` or `HF_TOKEN` | Read the reviews and produce pain points and recommendations |
 
 Why split it this way: a small classifier is fast, cheap and consistent for per-review labels, while turning
 hundreds of reviews into themes and feature ideas needs a language model's reasoning. Splitting the work also keeps
@@ -160,16 +160,18 @@ All expected failures raise a user-facing error shown in the UI rather than a st
 | Unreadable file, bad zip, unsupported type, no review column | Message naming the problem and the columns found |
 | Unparseable dates | Warning; trend is disabled or the affected reviews are excluded from it |
 | No English reviews | Message that only English is supported |
-| `HF_TOKEN` missing | Message explaining how to set it |
-| LLM request fails or times out | Message naming the model |
+| No LLM credentials | Message explaining how to set `LLM_API_KEY` or `HF_TOKEN` |
+| LLM request fails or times out | Message naming the model and HTTP status. Temporary errors (429, 5xx) are retried up to 3 times with waiting |
 | LLM returns unusable output twice | Message asking the user to retry |
 
 ## 5. Configuration
 
 | Setting | Default | Notes |
 |---|---|---|
-| `HF_TOKEN` (environment variable / Space secret) | none | Required for recommendations. Never commit it |
-| `LLM_MODEL` | `meta-llama/Llama-3.1-8B-Instruct` | Any instruct model available to your Inference provider |
+| `LLM_API_KEY` (environment variable, Space secret or `.env`) | none | Key for any OpenAI-compatible provider (for example Gemini). Takes priority over `HF_TOKEN`. Never commit it |
+| `LLM_BASE_URL` | Gemini's OpenAI-compatible endpoint | Endpoint used with `LLM_API_KEY` |
+| `HF_TOKEN` | none | Hugging Face Inference Providers. Free accounts have no credits, so this needs credits or PRO |
+| `LLM_MODEL` | `meta-llama/Llama-3.1-8B-Instruct` | Model name for the chosen provider, e.g. `gemini-2.5-flash` |
 | `SENTIMENT_MODEL` | `cardiffnlp/twitter-roberta-base-sentiment-latest` | Must output positive / neutral / negative labels |
 | `MAX_REVIEWS`, `LOW_CONFIDENCE`, `MIN_REVIEWS_PER_PERIOD`, `LLM_ATTEMPTS` | 200 / 0.60 / 3 / 2 | Constants at the top of `app.py` |
 
@@ -185,8 +187,9 @@ Run `pytest tests` (see the README). The 17 tests cover:
 - error handling (missing token, retry then fail);
 - one end-to-end run with the real sentiment model and a stubbed LLM.
 
-**What has not been tested:** the real Llama call. Test it by setting `HF_TOKEN`, running the sample dataset and
-checking that results are sensible, cite real reviews, and finish in reasonable time.
+**Tested live:** the sample dataset and the Talking Tom app-store subset were run end to end against `gemini-2.5-flash`
+(about 15 to 30 seconds each) and produced grounded pain points and recommendations. The Hugging Face Llama path was
+not usable because the account had no inference credits.
 
 **Suggested manual checks:** sample dataset; the Talking Tom subset of the app-store file (English); empty input;
 a CSV with the wrong columns; pasted undated reviews (no trend chart expected); a sarcastic line such as
@@ -213,7 +216,7 @@ Per analysis, cost has two parts:
 
 - **Sentiment:** runs locally on the Space's CPU; no per-call fee, but it adds latency (a few seconds for 200 reviews)
   and requires hosting.
-- **LLM:** one call. The prompt is roughly the sampled reviews at up to 600 characters each (about 200 reviews is
+- **LLM:** one call. With Gemini's free tier there is no charge, subject to rate limits and Google's free-tier data terms. The prompt is roughly the sampled reviews at up to 600 characters each (about 200 reviews is
   tens of thousands of tokens at most) plus a short JSON answer. Cost = tokens x your provider's per-token price, so
   check the current pricing for your chosen model and provider. Retries (at most one) can double it in the worst case.
 
@@ -223,9 +226,9 @@ with dataset size. Cite real prices and measured token counts in the memo rather
 ## 9. Deployment on Hugging Face Spaces
 
 1. Create a Space using the Gradio SDK.
-2. Upload `app.py`, `ingest.py`, `requirements.txt`, `README.md` and `sample_reviews.csv`. The `README.md` header
+2. Upload `app.py`, `ingest.py`, `requirements.txt`, `README.md` and `sample_reviews.csv`. Note: Gradio Spaces now require a paid Hugging Face plan. The `README.md` header
    block tells the Space which SDK, Python version and entry file to use.
-3. Add `HF_TOKEN` as a secret under Settings, then Variables and secrets.
+3. Add `LLM_API_KEY` as a secret and `LLM_MODEL` as a variable under Settings, then Variables and secrets.
 4. Wait for the build, open the public URL, and run the sample dataset once.
 
 The first request after a Space starts is slower because the sentiment model is downloaded and loaded.
