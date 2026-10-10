@@ -1,0 +1,5 @@
+gradio>=5.0
+huggingface_hub>=0.30
+transformers>=4.45
+torch
+pandas>=2.0
