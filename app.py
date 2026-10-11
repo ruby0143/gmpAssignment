@@ -762,7 +762,8 @@ def build_ui() -> gr.Blocks:
                 group_col = gr.Dropdown(label="Product / app column", choices=[])
 
         tiles = gr.HTML()
-        summary = gr.Markdown()
+        # min_height gives the progress bar room to show: an empty Markdown block is 0px tall and hides it
+        summary = gr.Markdown(min_height=80)
         with gr.Row():
             dist_plot = gr.BarPlot(
                 x="sentiment",
@@ -811,6 +812,8 @@ def build_ui() -> gr.Blocks:
             analyze,
             inputs=[file, target, product, *mapping, group_value, limit],
             outputs=[summary, tiles, dist_plot, trend_plot, pain_md, recs_md, review_table, report_btn],
+            show_progress="full",
+            show_progress_on=[summary],  # one progress bar instead of one overlay per output section
         )
     return demo
 
