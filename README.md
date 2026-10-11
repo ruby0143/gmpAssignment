@@ -60,6 +60,7 @@ Without an LLM credential the app still starts and runs sentiment analysis, but 
 1. Click **Load sample dataset** then **Analyze** for a quick demo, or upload your own file.
 2. Choose whether the reviews are for *your product* or a *competitor* (this changes how recommendations are framed).
 3. If the file contains several products, pick one in **Product / app to analyze**.
+4. Wait 30 to 60 seconds, then read the pain-point cards and recommendations. **Download report (Markdown)** saves them for a roadmap meeting.
 
 **Supported files:** CSV, TSV, JSON, JSONL, or a zip containing one of these. Review text, title, date, rating and
 product columns are auto-detected; override them under *Data mapping* if needed. Large files are randomly sampled

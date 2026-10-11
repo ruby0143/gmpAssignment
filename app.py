@@ -8,13 +8,18 @@ the customer reviews that support it; ids cited by the LLM are validated in code
 
 from __future__ import annotations
 
-import json
+import html
 import importlib.util
+import json
+import logging
 import os
+import re
+import tempfile
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 
@@ -59,15 +64,10 @@ NUM_RECOMMENDATIONS = 3
 LLM_ATTEMPTS = 2
 
 SENTIMENTS = ["positive", "neutral", "negative"]
-PAIN_POINT_COLUMNS = [
-    "#",
-    "Pain point",
-    "Severity (1-5)",
-    "Reviews citing",
-    "Share of reviews",
-    "What customers say",
-    "Example evidence",
-]
+SENTIMENT_COLORS = {"positive": "#2e9e5b", "neutral": "#9aa0a6", "negative": "#d93f3f"}
+REPORT_DIR = Path(tempfile.gettempdir()) / "review_insight_reports"
+PRIORITY_FORMULA = "impact × severity × number of supporting reviews ÷ effort"
+logger = logging.getLogger("review_insights")
 REVIEW_TABLE_COLUMNS = ["review", "date", "rating", "sentiment", "confidence", "low_confidence"]
 NONE_CHOICE = "(none)"
 SAMPLE_PATH = Path(__file__).parent / "sample_reviews.csv"
@@ -93,6 +93,7 @@ class Recommendation:
     impact: int
     effort: int
     pain_point_numbers: list[int]  # 1-based positions in the pain-point list
+    severity: int = 0  # highest severity among the pain points it addresses
     review_ids: list[int] = field(default_factory=list)
     score: float = 0.0
 
@@ -274,7 +275,7 @@ Return JSON with exactly this shape:
     {{"title": "concrete feature", "rationale": "why, grounded in the reviews", "impact": 1-5, "effort": 1-5, "pain_points": [1-based positions in the pain_points list this addresses]}}
   ]
 }}
-Rules: give 3 to 6 pain points sorted by importance, each citing at least one real review id. Give exactly {NUM_RECOMMENDATIONS} recommendations, each addressing at least one pain point. Severity and impact: 5 = highest. Effort: 5 = hardest. Recommendations must be concrete features, not vague advice."""
+Rules: never mention review ids (like R12) inside theme, description, title or rationale text; put them only in the id fields. Give 3 to 6 pain points sorted by importance, each citing at least one real review id. Give exactly {NUM_RECOMMENDATIONS} recommendations, each addressing at least one pain point. Severity and impact: 5 = highest. Effort: 5 = hardest. Recommendations must be concrete features, not vague advice."""
 
 
 def _extract_json(raw: str) -> dict:
@@ -332,6 +333,7 @@ def validate_payload(payload: dict, review_count: int) -> tuple[list[PainPoint],
             continue
         evidence = sorted({i for n in refs for i in positional[n - 1].review_ids})  # type: ignore[union-attr]
         impact, effort = _rating(item.get("impact"), "impact"), _rating(item.get("effort"), "effort")
+        severity = max(positional[n - 1].severity for n in refs)  # type: ignore[union-attr]
         recs.append(
             Recommendation(
                 title=title,
@@ -339,8 +341,9 @@ def validate_payload(payload: dict, review_count: int) -> tuple[list[PainPoint],
                 impact=impact,
                 effort=effort,
                 pain_point_numbers=refs,
+                severity=severity,
                 review_ids=evidence,
-                score=round(impact * len(evidence) / effort, 2),
+                score=round(impact * severity * len(evidence) / effort, 2),
             )
         )
 
@@ -442,64 +445,135 @@ def _excerpt(text: str, limit: int = 180) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
-def pain_point_table(points: list[PainPoint], df: pd.DataFrame) -> pd.DataFrame:
-    rows = []
+_REVIEW_ID_REFS = re.compile(r"\s*\(\s*R\d+(?:\s*[,;]\s*R\d+)*\s*\)|\s*\bR\d+(?:\s*[,;]\s*R\d+)*\b")
+
+
+def _clean(text: str) -> str:
+    """Drop internal review ids such as "(R10, R11)" that the model sometimes writes into prose."""
+    return _REVIEW_ID_REFS.sub("", text).strip()
+
+
+def _md(text: str) -> str:
+    """Escape Markdown control characters so review text and model output render literally."""
+    return "".join("\\" + c if c in "\\`*_[]<>~#|" else c for c in text)
+
+
+def _quoted(text: str, limit: int) -> str:
+    return f'"{_md(_excerpt(text, limit))}"'
+
+
+def pain_points_markdown(points: list[PainPoint], df: pd.DataFrame) -> str:
+    parts = []
     for n, p in enumerate(points, start=1):
-        examples = " | ".join(f'"{_excerpt(df.loc[i - 1, "review"], 120)}"' for i in p.review_ids[:2])
-        rows.append(
-            {
-                "#": n,
-                "Pain point": p.theme,
-                "Severity (1-5)": p.severity,
-                "Reviews citing": len(p.review_ids),
-                "Share of reviews": f"{len(p.review_ids) / len(df):.0%}",
-                "What customers say": p.description,
-                "Example evidence": examples,
-            }
+        quotes = "\n>\n".join(f"> {_quoted(df.loc[i - 1, 'review'], 160)}" for i in p.review_ids[:2])
+        parts.append(
+            f"### {n}. {_md(p.theme)}\n"
+            f"**Severity {p.severity}/5** · cited in **{len(p.review_ids)}** {'review' if len(p.review_ids) == 1 else 'reviews'} "
+            f"({len(p.review_ids) / len(df):.0%})\n\n"
+            f"{_md(_clean(p.description))}\n\n{quotes}"
         )
-    return pd.DataFrame(rows)
+    return "\n\n".join(parts)
 
 
 def recommendations_markdown(recs: list[Recommendation], points: list[PainPoint], df: pd.DataFrame) -> str:
     parts = []
     for rank, r in enumerate(recs, start=1):
-        addressed = ", ".join(f"#{n} {points[n - 1].theme}" for n in r.pain_point_numbers)
-        quotes = "\n".join(f'  - "{_excerpt(df.loc[i - 1, "review"])}"' for i in r.review_ids[:3])
+        addressed = ", ".join(f"#{n} {_md(points[n - 1].theme)}" for n in r.pain_point_numbers)
+        quotes = "\n".join(f"  - {_quoted(df.loc[i - 1, 'review'], 180)}" for i in r.review_ids[:3])
         parts.append(
-            f"### {rank}. {r.title}\n"
-            f"{r.rationale}\n\n"
-            f"- **Priority score:** {r.score} (impact {r.impact}/5 x {len(r.review_ids)} supporting reviews / effort {r.effort}/5)\n"
+            f"### {rank}. {_md(r.title)}\n"
+            f"{_md(_clean(r.rationale))}\n\n"
+            f"- **Priority score: {r.score}** (impact {r.impact}/5 × severity {r.severity}/5 × "
+            f"{len(r.review_ids)} supporting reviews ÷ effort {r.effort}/5)\n"
             f"- **Addresses:** {addressed}\n"
             f"- **Evidence ({len(r.review_ids)} reviews):**\n{quotes}"
         )
     return "\n\n".join(parts)
 
 
+def rating_mismatch_count(df: pd.DataFrame) -> int:
+    """Reviews whose star rating and text sentiment point in opposite directions."""
+    return int((((df["rating"] >= 4) & (df["sentiment"] == "negative")) | ((df["rating"] <= 2) & (df["sentiment"] == "positive"))).sum())
+
+
+def summary_tiles_html(df: pd.DataFrame) -> str:
+    """Row of key-number tiles; only numbers are interpolated, so no escaping is needed."""
+    share = dict(zip(*sentiment_distribution(df["sentiment"])[["sentiment", "share_pct"]].T.values))
+    tiles = [
+        (f"{len(df):,}", "reviews analyzed", "After removing empty, duplicate and non-English reviews and sampling."),
+        (f"{share['negative']:.0f}%", "negative", f"{share['positive']:.0f}% positive, {share['neutral']:.0f}% neutral."),
+    ]
+    if df["rating"].notna().any():
+        tiles.append((f"{df['rating'].mean():.2f}", "average stars", "Mean of the customers' own star ratings."))
+    tiles.append(
+        (
+            str(int(df["low_confidence"].sum())),
+            "low-confidence labels",
+            f"Sentiment confidence below {LOW_CONFIDENCE:.0%}: often sarcasm or mixed feelings.",
+        )
+    )
+    if df["rating"].notna().any():
+        tiles.append(
+            (str(rating_mismatch_count(df)), "stars vs text disagree", "High stars but negative text, or low stars but positive text.")
+        )
+    cells = "".join(
+        f'<div title="{html.escape(hint)}" style="flex:1 1 140px;padding:12px 14px;border:1px solid var(--border-color-primary);'
+        f'border-radius:8px;background:var(--block-background-fill);text-align:center">'
+        f'<div style="font-size:1.7em;font-weight:700;line-height:1.2">{value}</div>'
+        f'<div style="font-size:.85em;opacity:.75">{label}</div></div>'
+        for value, label, hint in tiles
+    )
+    return f'<div style="display:flex;flex-wrap:wrap;gap:10px;margin:4px 0 8px">{cells}</div>'
+
+
 def summary_markdown(df: pd.DataFrame, warnings: list[str]) -> str:
     dist = sentiment_distribution(df["sentiment"])
     share = dict(zip(dist["sentiment"], dist["share_pct"]))
-    low = int(df["low_confidence"].sum())
     text = (
         f"**{len(df)} reviews analyzed** - "
         f"{share['positive']}% positive, {share['neutral']}% neutral, {share['negative']}% negative."
     )
-    if low:
-        text += (
-            f"\n\n{low} review(s) were classified with low confidence (< {LOW_CONFIDENCE:.0%}); "
-            "these often involve sarcasm or mixed feelings. See the review-level table."
-        )
-    if df["rating"].notna().any():
-        mismatch = int(
-            (((df["rating"] >= 4) & (df["sentiment"] == "negative")) | ((df["rating"] <= 2) & (df["sentiment"] == "positive"))).sum()
-        )
-        text += f"\n\nAverage star rating: {df['rating'].mean():.2f}."
-        if mismatch:
-            text += f" In {mismatch} review(s) the star rating and the text sentiment disagree (possible sarcasm or misclassification)."
     if df["date"].notna().any():
-        text += f"\n\nDate range: {df['date'].min():%Y-%m-%d} to {df['date'].max():%Y-%m-%d}."
+        text += f" Reviews span {df['date'].min():%Y-%m-%d} to {df['date'].max():%Y-%m-%d}."
+    flagged = int(df["low_confidence"].sum()) + (rating_mismatch_count(df) if df["rating"].notna().any() else 0)
+    if flagged:
+        text += "\n\nLow-confidence labels and star/text disagreements often point to sarcasm or mixed feelings; see the review-level table."
     for w in warnings:
         text += f"\n\n> Note: {w}"
     return text
+
+
+def build_report_markdown(
+    df: pd.DataFrame, warnings: list[str], points: list[PainPoint], recs: list[Recommendation], product: str, target: str
+) -> str:
+    dist = sentiment_distribution(df["sentiment"])
+    rows = "\n".join(f"| {r.sentiment} | {r.reviews} | {r.share_pct}% |" for r in dist.itertuples())
+    notes = "\n".join(f"- {w}" for w in warnings) or "- None"
+    return (
+        f"# Review insights report: {_md(product) if product else 'untitled analysis'}\n\n"
+        f"Generated {datetime.now():%Y-%m-%d %H:%M}. Perspective: {target.lower()}. "
+        f"{len(df)} reviews analyzed.\n\n"
+        f"## Sentiment\n\n| Sentiment | Reviews | Share |\n|---|---|---|\n{rows}\n\n"
+        f"{summary_markdown(df, [])}\n\n"
+        f"## Key customer pain points\n\n{pain_points_markdown(points, df)}\n\n"
+        f"## Top {len(recs)} feature recommendations (prioritized)\n\n"
+        f"Priority score = {PRIORITY_FORMULA}. Impact, severity and effort are 1 to 5 estimates made by a language "
+        f"model; supporting reviews are verified against the data.\n\n{recommendations_markdown(recs, points, df)}\n\n"
+        f"## Data notes\n\n{notes}\n\n"
+        f"## Limitations\n{LIMITATIONS}"
+    )
+
+
+def write_report(markdown: str) -> str:
+    """Save the report to a temp file for download; removes reports older than an hour."""
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    cutoff = time.time() - 3600
+    for old in REPORT_DIR.glob("*.md"):
+        if old.stat().st_mtime < cutoff:
+            old.unlink(missing_ok=True)
+    path = REPORT_DIR / f"review-insights-{datetime.now():%Y%m%d-%H%M%S-%f}.md"
+    path.write_text(markdown, encoding="utf-8")
+    return str(path)
 
 
 LIMITATIONS = """
@@ -538,6 +612,20 @@ def _schema_from_ui(review, title, date, rating, group) -> ingest.Schema:
     return ingest.Schema(review=pick(review), title=pick(title), date=pick(date), rating=pick(rating), group=pick(group))
 
 
+def _failure_outputs(message: str):
+    """Show the failure reason in the summary area (persistent), and clear every other section."""
+    return (
+        f"### ⚠️ Analysis could not be completed\n\n{message}",
+        "",
+        None,
+        gr.update(visible=False),
+        "",
+        "",
+        pd.DataFrame(columns=REVIEW_TABLE_COLUMNS),
+        gr.update(visible=False),
+    )
+
+
 def analyze(
     file_path: str | None,
     target: str,
@@ -549,27 +637,39 @@ def analyze(
     group_col: str | None,
     group_value: str | None,
     limit: float,
+    progress: gr.Progress = gr.Progress(),
 ):
     try:
+        progress(0.05, desc="Reading and cleaning reviews")
         schema = (
             _schema_from_ui(review_col, title_col, date_col, rating_col, group_col) if review_col else None
         )  # no mapping chosen: auto-detect
         df, warnings = parse_reviews(file_path, schema, group_value or None, int(limit))
         check_usage_cap()
+        progress(0.25, desc="Classifying sentiment")
         df = pd.concat([df, run_sentiment(df["review"].tolist())], axis=1)
-        points, recs = generate_insights(df, target, product.strip() or (group_value or ""))
+        progress(0.5, desc="Extracting pain points and recommendations (longest step)")
+        name = product.strip() or (group_value or "")
+        points, recs = generate_insights(df, target, name)
+        progress(0.95, desc="Building report")
     except AnalysisError as exc:
-        raise gr.Error(str(exc)) from exc
+        return _failure_outputs(str(exc))
+    except Exception as exc:  # noqa: BLE001 - surface any unexpected failure to the user instead of a vanishing pop-up
+        logger.exception("Unexpected failure during analysis")
+        return _failure_outputs(f"Unexpected error ({type(exc).__name__}): {exc}. Please try again.")
 
     trend = sentiment_trend(df)
     review_table = df.assign(date=df["date"].dt.strftime("%Y-%m-%d").fillna(""))[REVIEW_TABLE_COLUMNS]
+    report = write_report(build_report_markdown(df, warnings, points, recs, name, target))
     return (
         summary_markdown(df, warnings),
+        summary_tiles_html(df),
         sentiment_distribution(df["sentiment"]),
         gr.update(value=trend, visible=trend is not None),
-        pain_point_table(points, df),
+        pain_points_markdown(points, df),
         recommendations_markdown(recs, points, df),
         review_table,
+        gr.update(value=report, visible=True),
     )
 
 
@@ -648,6 +748,10 @@ def build_ui() -> gr.Blocks:
                 with gr.Row():
                     sample_btn = gr.Button("Load sample dataset")
                     run_btn = gr.Button("Analyze", variant="primary")
+                gr.Markdown(
+                    "⏱ An analysis takes about 30 to 60 seconds. If the site has been idle, the first visit can take "
+                    "another 30 seconds to wake up. Please click **Analyze** once and wait."
+                )
 
         with gr.Accordion("Data mapping (auto-detected from your file)", open=False):
             with gr.Row():
@@ -657,29 +761,43 @@ def build_ui() -> gr.Blocks:
                 rating_col = gr.Dropdown(label="Rating column", choices=[])
                 group_col = gr.Dropdown(label="Product / app column", choices=[])
 
+        tiles = gr.HTML()
         summary = gr.Markdown()
         with gr.Row():
             dist_plot = gr.BarPlot(
-                x="sentiment", y="reviews", title="Sentiment distribution", sort=SENTIMENTS, y_lim=[0, None]
+                x="sentiment",
+                y="reviews",
+                color="sentiment",
+                color_map=SENTIMENT_COLORS,
+                title="Sentiment distribution",
+                x_title="Sentiment",
+                y_title="Number of reviews",
+                color_title="Sentiment",
+                sort=SENTIMENTS,
+                y_lim=[0, None],
             )
             trend_plot = gr.LinePlot(
                 x="period",
                 y="share_pct",
                 color="sentiment",
-                title=f"Sentiment trend (% per period, periods with {MIN_REVIEWS_PER_PERIOD}+ reviews)",
+                color_map=SENTIMENT_COLORS,
+                title=f"Sentiment trend (periods with {MIN_REVIEWS_PER_PERIOD}+ reviews)",
+                x_title="Period",
+                y_title="% of reviews",
+                color_title="Sentiment",
                 y_lim=[0, 100],
                 x_label_angle=45,
                 visible=False,
             )
         gr.Markdown("## Key customer pain points")
-        pain_table = gr.Dataframe(
-            headers=PAIN_POINT_COLUMNS,
-            wrap=True,
-            interactive=False,
-            column_widths=["5%", "16%", "9%", "9%", "9%", "26%", "26%"],
-        )
+        pain_md = gr.Markdown()
         gr.Markdown("## Top 3 feature recommendations (prioritized)")
+        gr.Markdown(
+            f"*Priority score = {PRIORITY_FORMULA}. Impact, severity and effort are 1 to 5 estimates by the language "
+            "model; the number of supporting reviews is checked against your data.*"
+        )
         recs_md = gr.Markdown()
+        report_btn = gr.DownloadButton("Download report (Markdown)", visible=False)
         with gr.Accordion("Review-level sentiment", open=False):
             review_table = gr.Dataframe(headers=REVIEW_TABLE_COLUMNS, wrap=True, interactive=False)
         with gr.Accordion("Limitations and responsible use", open=False):
@@ -692,7 +810,7 @@ def build_ui() -> gr.Blocks:
         run_btn.click(
             analyze,
             inputs=[file, target, product, *mapping, group_value, limit],
-            outputs=[summary, dist_plot, trend_plot, pain_table, recs_md, review_table],
+            outputs=[summary, tiles, dist_plot, trend_plot, pain_md, recs_md, review_table, report_btn],
         )
     return demo
 

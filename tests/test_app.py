@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -44,7 +45,7 @@ def test_validate_drops_ungrounded_and_ranks():
     assert points[1].review_ids == [4]  # invalid id 99 removed
     assert [r.title for r in recs] == ["A", "C", "B"]
     assert all(r.review_ids for r in recs)
-    assert recs[0].score == round(5 * 3 / 2, 2)
+    assert recs[0].score == round(5 * 5 * 3 / 2, 2) and recs[0].severity == 5  # impact x severity x reviews / effort
 
 
 def test_validate_rejects_too_few_recommendations():
@@ -113,11 +114,14 @@ def test_end_to_end_with_real_sentiment_model(monkeypatch, tmp_path):
     reviews = tmp_path / "r.csv"
     pd.DataFrame({"review": ["Battery is awful", "Love it", "Sync fails", "Works fine", "Terrible support", "Okay I guess"]}).to_csv(reviews, index=False)
     out = app.analyze(str(reviews), "Competitor product", "X", None, None, None, None, None, None, 200)
-    summary, dist, trend, pain, recs, table = out
-    assert "6 reviews analyzed" in summary
+    summary, tiles, dist, trend, pain, recs, table, report = out
+    assert "6 reviews analyzed" in summary and "reviews analyzed" in tiles
     assert dist["reviews"].sum() == 6
-    assert len(pain) == 2 and recs.count("###") == 3
+    assert pain.count("###") == 2 and recs.count("###") == 3
+    assert "severity 5/5" in recs and "Severity 5/5" in pain
     assert list(table.columns) == app.REVIEW_TABLE_COLUMNS
+    text = Path(report["value"]).read_text(encoding="utf-8")
+    assert "Priority score" in text and "Key customer pain points" in text and "Limitations" in text
 
 
 # ---------------------------------------------------------------- generic ingestion
@@ -274,7 +278,7 @@ def test_transient_errors_are_retried(monkeypatch):
 def test_analyze_autodetects_when_mapping_is_empty(monkeypatch):
     monkeypatch.setattr(app, "call_llm", lambda p, *a, **k: json.dumps(good_payload()))
     out = app.analyze(str(app.SAMPLE_PATH), "My product", "", None, None, None, None, None, None, 200)
-    assert "24 reviews analyzed" in out[0]
+    assert "24 reviews analyzed" in out[0] and "Average star" not in out[0]
 
 
 # ------------------------------------------------------- lightweight deployment mode
@@ -318,3 +322,55 @@ def test_product_name_follows_the_file(tmp_path):
     assert app._product_after_file_change(str(other), app.SAMPLE_PRODUCT)["value"] == ""  # stale sample name cleared
     assert "value" not in app._product_after_file_change(str(other), "My own name")  # user's name kept
     assert app._product_after_file_change(None, app.SAMPLE_PRODUCT)["value"] == ""
+
+
+def test_failures_are_shown_in_the_summary_not_raised():
+    out = app.analyze(None, "My product", "", None, None, None, None, None, None, 200)
+    assert len(out) == 8 and "could not be completed" in out[0] and "Upload a review dataset" in out[0]
+    assert out[1] == "" and out[4] == "" and out[5] == "" and out[7]["visible"] is False
+
+
+def test_unexpected_errors_are_shown_too(monkeypatch):
+    monkeypatch.setattr(app, "run_sentiment", lambda r: (_ for _ in ()).throw(RuntimeError("boom")))
+    out = app.analyze(str(app.SAMPLE_PATH), "My product", "", None, None, None, None, None, None, 200)
+    assert "Unexpected error (RuntimeError): boom" in out[0]
+
+
+def test_markdown_escaping_and_cards():
+    assert app._md("5*stars* <b> [x](y) #1") == "5\\*stars\\* \\<b\\> \\[x\\](y) \\#1"
+    df = make_df(6)
+    df.loc[0, "review"] = "<script>alert(1)</script> **bold**"
+    points, recs = app.validate_payload(good_payload(), 6)
+    cards = app.pain_points_markdown(points, df)
+    assert "\\<script\\>" in cards and "**bold**" not in cards and cards.startswith("### 1. Battery")
+
+
+def test_summary_tiles_cover_ratings_and_mismatches():
+    df = pd.DataFrame(
+        {
+            "review": list("abcd"), "date": pd.NaT, "rating": [5.0, 1.0, 5.0, 2.0],
+            "sentiment": ["negative", "negative", "positive", "positive"], "confidence": [0.9, 0.9, 0.5, 0.9],
+            "low_confidence": [False, False, True, False],
+        }
+    )
+    html = app.summary_tiles_html(df)
+    assert app.rating_mismatch_count(df) == 2
+    assert "average stars" in html and "3.25" in html and "stars vs text disagree" in html
+    assert "average stars" not in app.summary_tiles_html(df.assign(rating=float("nan")))
+
+
+def test_report_files_are_written_and_old_ones_removed(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "REPORT_DIR", tmp_path)
+    old = tmp_path / "old.md"
+    old.write_text("x")
+    os.utime(old, (1, 1))
+    path = app.write_report("# hello")
+    assert Path(path).read_text() == "# hello" and not old.exists()
+
+
+def test_review_ids_are_scrubbed_from_prose():
+    assert app._clean("Battery drains (R10, R11, R14) and sync fails (R7).") == "Battery drains and sync fails."
+    assert app._clean("Seen in R3, R4 and later R5") == "Seen in and later"
+    assert app._clean("Version R2D2 stays") == "Version R2D2 stays"
+    assert "cited in **1** review (" in app.pain_points_markdown([app.PainPoint("t", "d", 3, [1])], make_df(6))
+    assert "cited in **2** reviews (" in app.pain_points_markdown([app.PainPoint("t", "d", 3, [1, 2])], make_df(6))
