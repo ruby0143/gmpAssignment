@@ -12,7 +12,7 @@ pinned: false
 
 # Competitor Review & Feature Insight Generator
 
-Paste or upload customer or competitor reviews and get:
+Upload a file of customer or competitor reviews and get:
 - a sentiment breakdown (plus a trend chart when reviews are dated),
 - ranked customer pain points with supporting quotes,
 - **three prioritized feature recommendations**, each traced back to the reviews that support it.
@@ -57,7 +57,7 @@ Without an LLM credential the app still starts and runs sentiment analysis, but 
 
 ## Using it
 
-1. Click **Load sample dataset** then **Analyze** for a quick demo, or paste reviews (one per line), or upload a file.
+1. Click **Load sample dataset** then **Analyze** for a quick demo, or upload your own file.
 2. Choose whether the reviews are for *your product* or a *competitor* (this changes how recommendations are framed).
 3. If the file contains several products, pick one in **Product / app to analyze**.
 
@@ -76,14 +76,30 @@ product columns are auto-detected; override them under *Data mapping* if needed.
 | `LLM_BASE_URL` | Gemini's OpenAI-compatible endpoint | Provider endpoint used with `LLM_API_KEY` |
 | `HF_TOKEN` | none | Hugging Face token (needs inference credits) |
 | `LLM_MODEL` | `meta-llama/Llama-3.1-8B-Instruct` | Model name for the chosen provider, e.g. a Gemini model |
-| `SENTIMENT_MODEL` | `cardiffnlp/twitter-roberta-base-sentiment-latest` | English sentiment classifier |
+| `SENTIMENT_MODEL` | `cardiffnlp/twitter-roberta-base-sentiment-latest` | English sentiment classifier (PyTorch backend) |
+| `SENTIMENT_BACKEND` | `auto` | `transformers` (PyTorch), `onnx` (same model quantized, no PyTorch; use with `requirements-lite.txt`), or `auto` (PyTorch if installed) |
+| `MAX_ANALYSES_PER_HOUR` | `0` (unlimited) | Global cap to protect the LLM quota on a public deployment |
+| `PORT` | unset | When set (e.g. by Render), the app listens on `0.0.0.0:$PORT` |
 
-## Deploy to Hugging Face Spaces
+## Deploy (free, on Modal)
 
-1. Create a new Space with the **Gradio** SDK.
-2. Upload `app.py`, `ingest.py`, `requirements.txt`, `README.md` and `sample_reviews.csv`.
-3. In *Settings > Variables and secrets*, add `LLM_API_KEY` (secret) and `LLM_MODEL` (variable). Note that Gradio Spaces now require a paid Hugging Face plan.
-4. Wait for the build, then run the sample dataset once to confirm it works.
+The live demo runs on [Modal](https://modal.com), whose free Starter plan includes monthly compute credit. The whole app
+runs unchanged: Gradio, the PyTorch RoBERTa model (baked into the image) and the LLM.
+
+```bash
+pip install modal
+python -m modal setup                    # one-time browser sign-in
+python -m modal deploy modal_app.py      # reads LLM_API_KEY from .env and stores it as a Modal secret
+```
+
+The command prints the public URL. The container scales to zero after 10 minutes idle (the next visit takes about
+30 seconds to wake up) and analyses are capped at 20 per hour to protect the free LLM quota. Settings are in
+`modal_app.py`.
+
+Other hosts: any container platform with about 2 GB of RAM works (`python app.py` listens on `$PORT` when set).
+`requirements-lite.txt` with `SENTIMENT_BACKEND=onnx` runs a quantized copy of the same model without PyTorch, but it
+still peaks above 512 MB, so 512 MB free tiers (such as Render's) are not reliable. A Hugging Face Space also works
+(`README.md` header + `requirements.txt`), but new accounts need a paid plan for Gradio Spaces.
 
 ## Tests
 

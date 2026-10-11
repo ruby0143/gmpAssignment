@@ -14,7 +14,7 @@ prioritized product feature recommendations. Deliver it as a Hugging Face Space 
 
 | Requirement | How the app meets it |
 |---|---|
-| Takes raw reviews | Paste text, or upload CSV / TSV / JSON / JSONL / zip with any column names |
+| Takes raw reviews | Upload CSV / TSV / JSON / JSONL / zip with any column names |
 | Classifies sentiment trends | Per-review sentiment (positive / neutral / negative), distribution chart, and a trend chart when reviews have dates |
 | Extracts pain points | LLM groups complaints into themes with severity, review counts and example quotes |
 | 3 prioritized recommendations | Exactly three, each ranked by a transparent score and linked to supporting reviews |
@@ -27,7 +27,7 @@ automated roadmap.
 ## 2. Architecture at a glance
 
 ```
- Upload / paste
+ Upload
       |
       v
  ingest.py:  load -> detect columns -> filter product -> normalize -> English filter -> random sample
@@ -49,7 +49,9 @@ automated roadmap.
 | `sample_reviews.csv` | 24 dated smartwatch reviews for a quick demo |
 | `tests/test_app.py` | 17 automated tests (LLM stubbed, so no token needed) |
 | `requirements.txt` | Dependencies for local use and Hugging Face Spaces |
-| `README.md` | Setup, run, deploy. Its header block is the Space configuration |
+| `README.md` | Setup, run, deploy |
+| `modal_app.py` | Deployment definition for Modal (image, secret, scaling) |
+| `requirements-lite.txt` | Dependencies for the PyTorch-free ONNX mode |
 
 Two models are involved, with different jobs:
 
@@ -66,7 +68,7 @@ the per-analysis cost low (one LLM call per analysis, not one per review).
 
 ### Step 1: Input
 
-Users either paste reviews (one per line) or upload a file. An uploaded file takes precedence over pasted text.
+Users upload a review file (or click **Load sample dataset**).
 The "Whose reviews are these?" switch (my product vs competitor) is sent to the LLM so recommendations are framed
 correctly: fix complaints for your own product, or exploit gaps for a competitor's.
 
@@ -173,6 +175,8 @@ All expected failures raise a user-facing error shown in the UI rather than a st
 | `HF_TOKEN` | none | Hugging Face Inference Providers. Free accounts have no credits, so this needs credits or PRO |
 | `LLM_MODEL` | `meta-llama/Llama-3.1-8B-Instruct` | Model name for the chosen provider, e.g. `gemini-2.5-flash` |
 | `SENTIMENT_MODEL` | `cardiffnlp/twitter-roberta-base-sentiment-latest` | Must output positive / neutral / negative labels |
+| `SENTIMENT_BACKEND` | `auto` | `transformers`, or `onnx` = the same model quantized to int8, without PyTorch (`requirements-lite.txt`) (97.4% label agreement with the full model on 3,880 real reviews; identical 95.1% agreement with star polarity) |
+| `MAX_ANALYSES_PER_HOUR` | `0` | Global hourly cap for public deployments |
 | `MAX_REVIEWS`, `LOW_CONFIDENCE`, `MIN_REVIEWS_PER_PERIOD`, `LLM_ATTEMPTS` | 200 / 0.60 / 3 / 2 | Constants at the top of `app.py` |
 
 ## 6. Testing
@@ -192,7 +196,7 @@ Run `pytest tests` (see the README). The 17 tests cover:
 not usable because the account had no inference credits.
 
 **Suggested manual checks:** sample dataset; the Talking Tom subset of the app-store file (English); empty input;
-a CSV with the wrong columns; pasted undated reviews (no trend chart expected); a sarcastic line such as
+a CSV with the wrong columns; an undated CSV (no trend chart expected); a CSV containing a sarcastic line such as
 "Oh great, another update that kills the battery" (expect a low-confidence flag or a star/text mismatch).
 
 ## 7. Limitations and risks
@@ -223,15 +227,20 @@ Per analysis, cost has two parts:
 Because only one LLM call is made per analysis rather than one per review, cost scales with the sample size cap, not
 with dataset size. Cite real prices and measured token counts in the memo rather than the estimates here.
 
-## 9. Deployment on Hugging Face Spaces
+## 9. Deployment
 
-1. Create a Space using the Gradio SDK.
-2. Upload `app.py`, `ingest.py`, `requirements.txt`, `README.md` and `sample_reviews.csv`. Note: Gradio Spaces now require a paid Hugging Face plan. The `README.md` header
-   block tells the Space which SDK, Python version and entry file to use.
-3. Add `LLM_API_KEY` as a secret and `LLM_MODEL` as a variable under Settings, then Variables and secrets.
-4. Wait for the build, open the public URL, and run the sample dataset once.
+The app is deployed on **Modal** (`modal_app.py`, deploy with `python -m modal deploy modal_app.py`). This was chosen
+after checking the alternatives:
 
-The first request after a Space starts is slower because the sentiment model is downloaded and loaded.
+| Option | Outcome |
+|---|---|
+| Hugging Face Spaces | Gradio Spaces now need a paid plan; free ZeroGPU Spaces need an account older than 30 days |
+| Render free tier (512 MB) | Too small: the app peaks at about 1 GB with PyTorch, and about 520 to 590 MB even with the quantized ONNX model |
+| **Modal free Starter plan** | Works: full app, 2 GB container, scales to zero when idle, within the monthly free credit |
+
+Measured on the live deployment: cold start about 31 seconds, then about 30 seconds for the 24-review sample and about
+55 seconds for 200 app-store reviews (sentiment plus one LLM call). The image includes the sentiment model, the LLM key
+is stored as a Modal secret, and a cap of 20 analyses per hour protects the free LLM quota.
 
 ## 10. Extending the app
 

@@ -67,26 +67,26 @@ def test_extract_json_with_fences():
         app._extract_json("no json")
 
 
-def test_parse_text_and_limits():
-    df, warnings = app.parse_reviews("good\n\nbad\n", None)
-    assert list(df["review"]) == ["good", "bad"] and warnings
-    with pytest.raises(app.AnalysisError):
-        app.parse_reviews("  \n ", None)
-    big, w = app.parse_reviews("\n".join(f"review {i}" for i in range(250)), None)
-    assert len(big) == app.MAX_REVIEWS and w
+def test_parse_requires_a_file_and_limits_size(tmp_path):
+    with pytest.raises(app.AnalysisError, match="Upload"):
+        app.parse_reviews(None)
+    big = tmp_path / "big.csv"
+    pd.DataFrame({"review": [f"review {i}" for i in range(250)]}).to_csv(big, index=False)
+    df, w = app.parse_reviews(str(big))
+    assert len(df) == app.MAX_REVIEWS and any("sampled" in x for x in w)
 
 
 def test_parse_csv_sample_and_bad_csv(tmp_path):
-    df, _ = app.parse_reviews("", str(app.SAMPLE_PATH))
+    df, _ = app.parse_reviews(str(app.SAMPLE_PATH))
     assert len(df) == 24 and df["date"].notna().all()
     bad = tmp_path / "bad.csv"
     bad.write_text("foo,bar\n1,2\n")
     with pytest.raises(app.AnalysisError):
-        app.parse_reviews("", str(bad))
+        app.parse_reviews(str(bad))
 
 
 def test_trend_requires_two_periods():
-    df, _ = app.parse_reviews("", str(app.SAMPLE_PATH))
+    df, _ = app.parse_reviews(str(app.SAMPLE_PATH))
     df["sentiment"] = ["positive", "negative"] * 12
     trend = app.sentiment_trend(df)
     assert trend is not None and set(trend["sentiment"]) == set(app.SENTIMENTS)
@@ -102,18 +102,17 @@ def test_missing_token_is_explicit(monkeypatch):
 
 def test_generate_retries_then_fails(monkeypatch):
     calls = []
-    monkeypatch.setattr(app, "call_llm", lambda p: calls.append(1) or "not json")
+    monkeypatch.setattr(app, "call_llm", lambda p, *a, **k: calls.append(1) or "not json")
     with pytest.raises(app.AnalysisError):
         app.generate_insights(make_df(), "My product", "")
     assert len(calls) == app.LLM_ATTEMPTS
 
 
-def test_end_to_end_with_real_sentiment_model(monkeypatch):
-    monkeypatch.setattr(app, "call_llm", lambda p: "Sure!\n" + json.dumps(good_payload()))
-    out = app.analyze(
-        "Battery is awful\nLove it\nSync fails\nWorks fine\nTerrible support\nOkay I guess",
-        None, "Competitor product", "X", None, None, None, None, None, None, 200,
-    )
+def test_end_to_end_with_real_sentiment_model(monkeypatch, tmp_path):
+    monkeypatch.setattr(app, "call_llm", lambda p, *a, **k: "Sure!\n" + json.dumps(good_payload()))
+    reviews = tmp_path / "r.csv"
+    pd.DataFrame({"review": ["Battery is awful", "Love it", "Sync fails", "Works fine", "Terrible support", "Okay I guess"]}).to_csv(reviews, index=False)
+    out = app.analyze(str(reviews), "Competitor product", "X", None, None, None, None, None, None, 200)
     summary, dist, trend, pain, recs, table = out
     assert "6 reviews analyzed" in summary
     assert dist["reviews"].sum() == 6
@@ -191,9 +190,9 @@ def test_ingest_errors(tmp_path):
 def test_parse_reviews_with_group_and_sampling(tmp_path):
     f = tmp_path / "r.json"
     f.write_text(json.dumps(app_store_records(300)))
-    df, warnings = app.parse_reviews("", str(f), None, "alpha", 50)
+    df, warnings = app.parse_reviews(str(f), None, "alpha", 50)
     assert len(df) == 50 and set(df["group"]) == {"alpha"} and any("sampled" in w for w in warnings)
-    again, _ = app.parse_reviews("", str(f), None, "alpha", 50)
+    again, _ = app.parse_reviews(str(f), None, "alpha", 50)
     assert df["review"].tolist() == again["review"].tolist()  # reproducible
 
 
@@ -273,6 +272,49 @@ def test_transient_errors_are_retried(monkeypatch):
 
 
 def test_analyze_autodetects_when_mapping_is_empty(monkeypatch):
-    monkeypatch.setattr(app, "call_llm", lambda p: json.dumps(good_payload()))
-    out = app.analyze("", str(app.SAMPLE_PATH), "My product", "", None, None, None, None, None, None, 200)
+    monkeypatch.setattr(app, "call_llm", lambda p, *a, **k: json.dumps(good_payload()))
+    out = app.analyze(str(app.SAMPLE_PATH), "My product", "", None, None, None, None, None, None, 200)
     assert "24 reviews analyzed" in out[0]
+
+
+# ------------------------------------------------------- lightweight deployment mode
+
+
+def test_unknown_sentiment_backend(monkeypatch):
+    monkeypatch.setattr(app, "SENTIMENT_BACKEND", "bogus")
+    with pytest.raises(app.AnalysisError, match="SENTIMENT_BACKEND"):
+        app.run_sentiment(["x"])
+
+
+def test_auto_backend_falls_back_to_onnx_without_torch(monkeypatch):
+    monkeypatch.setattr(app, "SENTIMENT_BACKEND", "auto")
+    monkeypatch.setattr(app.importlib.util, "find_spec", lambda name: None)
+    assert app.sentiment_backend() == "onnx"
+
+
+def test_onnx_backend_classifies_like_the_original_model():
+    pytest.importorskip("onnxruntime")
+    pytest.importorskip("tokenizers")
+    reviews = ["I absolutely love this, best purchase ever!", "Terrible. Crashes every day and support ignores me.", "It arrived on Tuesday."]
+    out = app.classify_sentiment_onnx(reviews)
+    assert list(out["sentiment"]) == ["positive", "negative", "neutral"]
+    assert out["confidence"].between(0, 1).all() and list(out.columns) == ["sentiment", "confidence", "low_confidence"]
+
+
+def test_usage_cap(monkeypatch):
+    monkeypatch.setattr(app, "MAX_ANALYSES_PER_HOUR", 2)
+    monkeypatch.setattr(app, "_recent_analyses", app.deque())
+    app.check_usage_cap(now=1000)
+    app.check_usage_cap(now=1010)
+    with pytest.raises(app.AnalysisError, match="2 analyses per hour"):
+        app.check_usage_cap(now=1020)
+    app.check_usage_cap(now=1000 + 3601)  # oldest entry expired
+
+
+def test_product_name_follows_the_file(tmp_path):
+    other = tmp_path / "other.csv"
+    other.write_text("review\nx\n")
+    assert app._product_after_file_change(str(app.SAMPLE_PATH), "")["value"] == app.SAMPLE_PRODUCT
+    assert app._product_after_file_change(str(other), app.SAMPLE_PRODUCT)["value"] == ""  # stale sample name cleared
+    assert "value" not in app._product_after_file_change(str(other), "My own name")  # user's name kept
+    assert app._product_after_file_change(None, app.SAMPLE_PRODUCT)["value"] == ""

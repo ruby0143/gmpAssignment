@@ -9,8 +9,11 @@ the customer reviews that support it; ids cited by the LLM are validated in code
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
+import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -42,6 +45,11 @@ SENTIMENT_MODEL = os.environ.get("SENTIMENT_MODEL", "cardiffnlp/twitter-roberta-
 LLM_MODEL = os.environ.get("LLM_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
 DEFAULT_LLM_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"  # Gemini
 LLM_TIMEOUT_SECONDS = 180
+# "transformers" (PyTorch), "onnx" (same model, quantized, no PyTorch: fits 512 MB hosts) or "auto"
+SENTIMENT_BACKEND = os.environ.get("SENTIMENT_BACKEND", "auto").strip().lower()
+ONNX_SENTIMENT_REPO = os.environ.get("ONNX_SENTIMENT_MODEL", "Xenova/twitter-roberta-base-sentiment-latest")
+ONNX_SENTIMENT_FILE = "onnx/model_quantized.onnx"
+MAX_ANALYSES_PER_HOUR = int(os.environ.get("MAX_ANALYSES_PER_HOUR", "0"))  # 0 = unlimited; set on public deployments
 
 MAX_REVIEWS = 200
 MAX_REVIEW_CHARS = 600
@@ -63,6 +71,7 @@ PAIN_POINT_COLUMNS = [
 REVIEW_TABLE_COLUMNS = ["review", "date", "rating", "sentiment", "confidence", "low_confidence"]
 NONE_CHOICE = "(none)"
 SAMPLE_PATH = Path(__file__).parent / "sample_reviews.csv"
+SAMPLE_PRODUCT = "Smartwatch (sample)"
 
 
 class AnalysisError(Exception):
@@ -92,7 +101,6 @@ class Recommendation:
 
 
 def parse_reviews(
-    text: str | None,
     file_path: str | None,
     schema: ingest.Schema | None = None,
     group_value: str | None = None,
@@ -100,13 +108,10 @@ def parse_reviews(
 ) -> tuple[pd.DataFrame, list[str]]:
     """Return DataFrame[review, date, rating, group] (sampled to `limit`) and non-fatal warnings."""
     try:
-        if file_path:
-            raw = ingest.load_table(file_path)
-            df, warnings = ingest.normalize(raw, schema or ingest.detect_schema(raw), group_value)
-        elif text and text.strip():
-            df, warnings = ingest.normalize(pd.DataFrame({"review": text.splitlines()}), ingest.Schema(review="review"))
-        else:
-            raise AnalysisError("Paste some reviews (one per line) or upload a file.")
+        if not file_path:
+            raise AnalysisError("Upload a review dataset first (or click 'Load sample dataset').")
+        raw = ingest.load_table(file_path)
+        df, warnings = ingest.normalize(raw, schema or ingest.detect_schema(raw), group_value)
         df, english_warnings = ingest.filter_english(df)
         df, sample_warnings = ingest.sample_reviews(df, limit)
     except ingest.IngestError as exc:
@@ -138,6 +143,63 @@ def classify_sentiment(reviews: list[str]) -> pd.DataFrame:
         raise AnalysisError(f"Sentiment model returned unexpected labels: {sorted(unknown)}")
     out["low_confidence"] = out["confidence"] < LOW_CONFIDENCE
     return out
+
+
+@lru_cache(maxsize=1)
+def _onnx_sentiment():
+    """Quantized ONNX export of the same RoBERTa sentiment model, run with onnxruntime (no PyTorch)."""
+    import onnxruntime as ort
+    from huggingface_hub import hf_hub_download
+    from tokenizers import Tokenizer
+
+    def fetch(name: str) -> str:
+        return hf_hub_download(ONNX_SENTIMENT_REPO, name)
+
+    tokenizer = Tokenizer.from_file(fetch("tokenizer.json"))
+    tokenizer.enable_truncation(max_length=512)
+    tokenizer.enable_padding(pad_id=tokenizer.token_to_id("<pad>"), pad_token="<pad>")
+    labels = json.loads(Path(fetch("config.json")).read_text())["id2label"]
+    options = ort.SessionOptions()
+    options.enable_cpu_mem_arena = False  # lower peak memory on small hosts
+    session = ort.InferenceSession(fetch(ONNX_SENTIMENT_FILE), options, providers=["CPUExecutionProvider"])
+    return tokenizer, session, [labels[str(i)].lower() for i in range(len(labels))]
+
+
+def classify_sentiment_onnx(reviews: list[str], batch_size: int = 16) -> pd.DataFrame:
+    import numpy as np
+
+    tokenizer, session, labels = _onnx_sentiment()
+    sentiments: list[str] = []
+    confidences: list[float] = []
+    for start in range(0, len(reviews), batch_size):
+        encoded = tokenizer.encode_batch(reviews[start : start + batch_size])
+        feeds = {
+            "input_ids": np.array([e.ids for e in encoded], dtype=np.int64),
+            "attention_mask": np.array([e.attention_mask for e in encoded], dtype=np.int64),
+        }
+        logits = session.run(["logits"], feeds)[0]
+        probs = np.exp(logits - logits.max(axis=1, keepdims=True))
+        probs /= probs.sum(axis=1, keepdims=True)
+        sentiments += [labels[i] for i in probs.argmax(axis=1)]
+        confidences += [round(float(p), 3) for p in probs.max(axis=1)]
+    out = pd.DataFrame({"sentiment": sentiments, "confidence": confidences})
+    out["low_confidence"] = out["confidence"] < LOW_CONFIDENCE
+    return out
+
+
+def sentiment_backend() -> str:
+    if SENTIMENT_BACKEND == "auto":
+        return "transformers" if importlib.util.find_spec("torch") else "onnx"
+    return SENTIMENT_BACKEND
+
+
+def run_sentiment(reviews: list[str]) -> pd.DataFrame:
+    backend = sentiment_backend()
+    if backend == "transformers":
+        return classify_sentiment(reviews)
+    if backend == "onnx":
+        return classify_sentiment_onnx(reviews)
+    raise AnalysisError(f"Unknown SENTIMENT_BACKEND '{SENTIMENT_BACKEND}'; use 'auto', 'transformers' or 'onnx'.")
 
 
 def sentiment_distribution(sentiments: pd.Series) -> pd.DataFrame:
@@ -301,13 +363,13 @@ TRANSIENT_STATUS = {429, 500, 502, 503, 504}
 TRANSIENT_RETRY_DELAYS = (3, 8, 15)  # seconds to wait before each retry
 
 
-def _call_openai_compatible(prompt: str, base_url: str, api_key: str) -> str:
+def _call_openai_compatible(prompt: str, base_url: str, api_key: str, system: str) -> str:
     """Any OpenAI-compatible chat endpoint (Gemini, Groq, OpenRouter, GitHub Models, ...). Retries transient errors."""
     payload = {
         "model": LLM_MODEL,
-        "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
         "temperature": 0.2,
-        "max_tokens": 8000,  # generous: reasoning models count thinking tokens against this limit
+        "max_tokens": 16000,  # generous: reasoning models count thinking tokens against this limit
     }
     url = f"{base_url.rstrip('/')}/chat/completions"
     for attempt in range(len(TRANSIENT_RETRY_DELAYS) + 1):
@@ -337,9 +399,10 @@ def _call_openai_compatible(prompt: str, base_url: str, api_key: str) -> str:
 
 def call_llm(prompt: str) -> str:
     """Use an OpenAI-compatible provider if LLM_API_KEY is set, otherwise the Hugging Face Inference API."""
+    system = SYSTEM_PROMPT
     api_key = os.environ.get("LLM_API_KEY")
     if api_key:
-        return _call_openai_compatible(prompt, os.environ.get("LLM_BASE_URL", DEFAULT_LLM_BASE_URL), api_key)
+        return _call_openai_compatible(prompt, os.environ.get("LLM_BASE_URL", DEFAULT_LLM_BASE_URL), api_key, system)
 
     token = os.environ.get("HF_TOKEN")
     if not token:
@@ -350,8 +413,8 @@ def call_llm(prompt: str) -> str:
     client = InferenceClient(model=LLM_MODEL, token=token, timeout=LLM_TIMEOUT_SECONDS)
     try:
         response = client.chat_completion(
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
-            max_tokens=2500,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+            max_tokens=4000,
             temperature=0.2,
         )
     except (HfHubHTTPError, InferenceTimeoutError, httpx.HTTPError) as exc:
@@ -441,12 +504,33 @@ def summary_markdown(df: pd.DataFrame, warnings: list[str]) -> str:
 
 LIMITATIONS = """
 - **Sarcasm and mixed sentiment:** classifiers misread statements like "great, another update that kills the battery". Check the low-confidence flags and review-level table.
-- **English only:** the sentiment model is English-only; non-English reviews are detected heuristically and excluded.
-- **Domain specificity:** the sentiment model is trained on general social text; industry jargon can reduce accuracy.
+- **English only:** only English reviews are supported; non-English reviews are detected heuristically and excluded.
+- **Domain specificity:** the RoBERTa sentiment model is trained on general social media text (lightweight deployments run a quantized copy of it); industry jargon can reduce accuracy.
 - **Sample bias:** reviews over-represent very happy and very unhappy customers and may not reflect your whole customer base.
 - **LLM output is decision support:** themes and recommendations are generated by a language model. Cited reviews are verified to exist, but whether they truly support a claim should be confirmed by a person before roadmap decisions.
-- **Privacy:** do not paste confidential or personal customer data into a public demo.
+- **Privacy:** do not upload confidential or personal customer data to a public demo.
 """
+
+
+_usage_lock = threading.Lock()
+_recent_analyses: deque[float] = deque()
+
+
+def check_usage_cap(now: float | None = None) -> None:
+    """Global hourly cap so a public demo can't exhaust the LLM quota."""
+    if MAX_ANALYSES_PER_HOUR <= 0:
+        return
+    now = time.time() if now is None else now
+    with _usage_lock:
+        while _recent_analyses and now - _recent_analyses[0] > 3600:
+            _recent_analyses.popleft()
+        if len(_recent_analyses) >= MAX_ANALYSES_PER_HOUR:
+            wait_min = int((3600 - (now - _recent_analyses[0])) // 60) + 1
+            raise AnalysisError(
+                f"This demo is limited to {MAX_ANALYSES_PER_HOUR} analyses per hour to protect its free API quota. "
+                f"Please try again in about {wait_min} minute(s)."
+            )
+        _recent_analyses.append(now)
 
 
 def _schema_from_ui(review, title, date, rating, group) -> ingest.Schema:
@@ -455,7 +539,6 @@ def _schema_from_ui(review, title, date, rating, group) -> ingest.Schema:
 
 
 def analyze(
-    text: str,
     file_path: str | None,
     target: str,
     product: str,
@@ -469,10 +552,11 @@ def analyze(
 ):
     try:
         schema = (
-            _schema_from_ui(review_col, title_col, date_col, rating_col, group_col) if file_path and review_col else None
+            _schema_from_ui(review_col, title_col, date_col, rating_col, group_col) if review_col else None
         )  # no mapping chosen: auto-detect
-        df, warnings = parse_reviews(text, file_path, schema, group_value or None, int(limit))
-        df = pd.concat([df, classify_sentiment(df["review"].tolist())], axis=1)
+        df, warnings = parse_reviews(file_path, schema, group_value or None, int(limit))
+        check_usage_cap()
+        df = pd.concat([df, run_sentiment(df["review"].tolist())], axis=1)
         points, recs = generate_insights(df, target, product.strip() or (group_value or ""))
     except AnalysisError as exc:
         raise gr.Error(str(exc)) from exc
@@ -489,16 +573,24 @@ def analyze(
     )
 
 
-def inspect_upload(file_path: str | None):
+def _product_after_file_change(file_path: str | None, product: str) -> dict:
+    """Keep the product-name box consistent with the file: set it for the sample, clear a stale sample name."""
+    if file_path and Path(file_path).name == SAMPLE_PATH.name:
+        return gr.update(value=SAMPLE_PRODUCT)
+    return gr.update(value="") if product == SAMPLE_PRODUCT else gr.update()
+
+
+def inspect_upload(file_path: str | None, product: str = ""):
     """Load an uploaded file, auto-detect its columns, and populate the mapping controls."""
     empty = gr.update(choices=[], value=None)
+    name = _product_after_file_change(file_path, product)
     if not file_path:
-        return "", empty, empty, empty, empty, empty, empty
+        return "", empty, empty, empty, empty, empty, empty, name
     try:
         raw = ingest.load_table(file_path)
     except ingest.IngestError as exc:
         gr.Warning(str(exc))
-        return f"Could not read the file: {exc}", empty, empty, empty, empty, empty, empty
+        return f"Could not read the file: {exc}", empty, empty, empty, empty, empty, empty, name
     schema = ingest.detect_schema(raw)
     columns = [str(c) for c in raw.columns]
     optional = [NONE_CHOICE, *columns]
@@ -514,6 +606,7 @@ def inspect_upload(file_path: str | None):
         gr.update(choices=optional, value=schema.rating or NONE_CHOICE),
         gr.update(choices=optional, value=schema.group or NONE_CHOICE),
         gr.update(choices=groups, value=groups[0][1] if groups else None, visible=bool(groups)),
+        name,
     )
 
 
@@ -525,7 +618,7 @@ def refresh_groups(file_path: str | None, group_col: str | None):
 
 
 def load_sample():
-    return None, str(SAMPLE_PATH), "Smartwatch (sample)"
+    return str(SAMPLE_PATH), SAMPLE_PRODUCT
 
 
 # --------------------------------------------------------------------------- UI
@@ -540,22 +633,17 @@ def build_ui() -> gr.Blocks:
         )
         with gr.Row():
             with gr.Column():
-                target = gr.Radio(["My product", "Competitor product"], value="My product", label="Whose reviews are these?")
-                product = gr.Textbox(label="Product name (optional)", placeholder="e.g. Acme Smartwatch")
-                text = gr.Textbox(
-                    label="Paste reviews (one review per line)",
-                    lines=8,
-                    placeholder="Battery dies in a day.\nLove the screen!",
-                )
-            with gr.Column():
                 file = gr.File(
-                    label="...or upload a dataset (CSV, TSV, JSON, JSONL or zip) - any column names work",
+                    label="Upload a review dataset (CSV, TSV, JSON, JSONL or zip) - any column names work",
                     file_types=ingest.UPLOAD_TYPES,
                     type="filepath",
                     height=140,
                 )
                 file_info = gr.Markdown()
                 group_value = gr.Dropdown(label="Product / app to analyze", choices=[], visible=False)
+            with gr.Column():
+                target = gr.Radio(["My product", "Competitor product"], value="My product", label="Whose reviews are these?")
+                product = gr.Textbox(label="Product name (optional)", placeholder="e.g. Acme Smartwatch")
                 limit = gr.Slider(50, 300, value=MAX_REVIEWS, step=10, label="Max reviews to analyze (random sample if larger)")
                 with gr.Row():
                     sample_btn = gr.Button("Load sample dataset")
@@ -598,12 +686,12 @@ def build_ui() -> gr.Blocks:
             gr.Markdown(LIMITATIONS)
 
         mapping = [review_col, title_col, date_col, rating_col, group_col]
-        sample_btn.click(load_sample, outputs=[text, file, product])
-        file.change(inspect_upload, inputs=file, outputs=[file_info, *mapping, group_value])
+        sample_btn.click(load_sample, outputs=[file, product])
+        file.change(inspect_upload, inputs=[file, product], outputs=[file_info, *mapping, group_value, product])
         group_col.input(refresh_groups, inputs=[file, group_col], outputs=group_value)
         run_btn.click(
             analyze,
-            inputs=[text, file, target, product, *mapping, group_value, limit],
+            inputs=[file, target, product, *mapping, group_value, limit],
             outputs=[summary, dist_plot, trend_plot, pain_table, recs_md, review_table],
         )
     return demo
@@ -612,4 +700,7 @@ def build_ui() -> gr.Blocks:
 demo = build_ui()
 
 if __name__ == "__main__":
-    demo.launch()
+    port = os.environ.get("PORT")  # set by hosts such as Render
+    demo.queue(default_concurrency_limit=2).launch(
+        server_name="0.0.0.0" if port else None, server_port=int(port) if port else None
+    )
